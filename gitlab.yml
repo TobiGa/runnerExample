@@ -1,0 +1,73 @@
+image: docker:stable
+
+variables:
+  CI_DEBUG_TRACE: "false"
+  # When using dind service we need to instruct docker, to talk with the
+  # daemon started inside of the service. The daemon is available with
+  # a network connection instead of the default /var/run/docker.sock socket.
+  #
+  # The 'docker' hostname is the alias of the service container as described at
+  # https://docs.gitlab.com/ee/ci/docker/using_docker_images.html#accessing-the-services
+  #
+  # Note that if you're using Kubernetes executor, the variable should be set to
+  # tcp://localhost:2375 because of how Kubernetes executor connects services
+  # to the job container
+  DOCKER_HOST: tcp://docker:2375/
+
+  # When using dind, it's wise to use the overlayfs driver for
+  # improved performance.
+  DOCKER_DRIVER: overlay2
+
+services:
+  - docker:dind
+    
+before_script:
+  - docker info
+  # add needed packages
+  - apk update
+  - apk add bash
+  - apk add git
+  - apk add openssh-client
+  - apk add py-pip
+  - pip install docker-compose
+  # run ssh and add keys
+  - eval $(ssh-agent -s)
+  - echo "$RUNNER_DEPLOY_KEY_PRIVATE" | tr -d '\r' | ssh-add - > /dev/null
+  - mkdir -p ~/.ssh
+  - chmod 700 ~/.ssh
+  - ssh-keyscan -H 'our.gitlab.de' >> ~/.ssh/known_hosts  
+
+stages:
+  - test
+
+runtest:
+  stage: test
+  script:
+    # Load submodules on 1# level
+    - git submodule update --init
+    # deinit submodules
+    - cd mbsmoodle && git submodule deinit -f .
+    # rewrite submodules of mbsmoodle repository from https to ssh
+    - sed -i -e 's/https\:\/\/our.gitlab\.de\//git@gitlab\.our.gitlab.de\:/g' .gitmodules
+    - cat .gitmodules
+    # Load submodules on 2# level to
+    - git submodule update --init
+    # rewrite submodules of mod_hvp repository
+    - sed -i -e 's/https\:\/\/gitlab\.our.gitlab.de\//git@gitlab\.our.gitlab.de\:/g' mod/hvp/.gitmodules
+    - cd mod/hvp && git submodule deinit -f .
+    - cd ../../..
+    # initialise again to make changes effective
+    - git submodule update --init --recursive
+    # Start containers
+    - bin/moodle-docker-compose up -d
+    # wait for db to get ready
+    - sleep 120
+    # Initialize behat environment
+    - bin/moodle-docker-compose exec -T webserver php admin/tool/behat/cli/init.php
+    # run behat tests
+    - bin/moodle-docker-compose exec -T webserver php admin/tool/behat/cli/run.php --tags=@MBS_TESTRUN --format pretty --out "/var/www/behatfaildumps/pretty__$(date +"%y_%m_%d:%s").txt" --format moodle_progress --out "/var/www/behatfaildumps/mo_prog_$(date +"%y_%m_%d:%s").txt"
+    # Initialize phpunit environment
+    - bin/moodle-docker-compose exec -T webserver php admin/tool/phpunit/cli/init.php
+    # Run phpunit tests
+    - bin/moodle-docker-compose exec -T webserver vendor/bin/phpunit auth_manual_testcase auth/manual/tests/manual_test.php
+
